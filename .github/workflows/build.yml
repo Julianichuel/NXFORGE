@@ -1,24 +1,155 @@
-name: Build IPA
+name: Build game IPA
+
+# Lo lanza la app NxForge Studio (o a mano desde Actions).
+# Secretos necesarios (Settings > Secrets and variables > Actions):
+#   PROD_KEYS_B64      -> tu prod.keys en base64 (la app lo copia al portapapeles)
+#   ARTIFACT_PASSWORD  -> una contrasena tuya; la app usa la misma para descifrar el IPA
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+    inputs:
+      game_url_enc:
+        description: "Enlaces al juego, cifrados por la app"
+        required: true
+        type: string
+      memory:
+        description: "Perfil de memoria del iPhone"
+        required: true
+        type: choice
+        default: "6gb"
+        options:
+          - "4gb"
+          - "6gb"
+          - "256"
+          - "none"
+      runner:
+        description: "Maquina de GitHub"
+        required: true
+        type: choice
+        default: xcode-27
+        options:
+          - xcode-27
+          - macos-26
 
 jobs:
   build:
-    runs-on: macos-15
+    runs-on: ${{ inputs.runner }}
+    timeout-minutes: 355
+    env:
+      ARTIFACT_PASSWORD: ${{ secrets.ARTIFACT_PASSWORD }}
+      PROD_KEYS_B64: ${{ secrets.PROD_KEYS_B64 }}
     steps:
-      - uses: actions/checkout@v4
-      - run: unzip -q NxForge-Studio-project.zip
-      - run: brew install xcodegen && xcodegen generate
-        working-directory: NusaLibrary
-      - run: xcodebuild -project NusaLibrary.xcodeproj -scheme NusaLibrary -configuration Release -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY=""
-        working-directory: NusaLibrary
-      - run: mkdir Payload && cp -R build/Build/Products/Release-iphoneos/NusaLibrary.app Payload/ && zip -qr NxForge-Studio.ipa Payload
-        working-directory: NusaLibrary
-      - uses: actions/upload-artifact@v4
+      - name: 1. Comprobar secretos
+        run: |
+          [ -n "$ARTIFACT_PASSWORD" ] || { echo "::error::Falta el secreto ARTIFACT_PASSWORD"; exit 1; }
+          [ -n "$PROD_KEYS_B64" ] || { echo "::error::Falta el secreto PROD_KEYS_B64"; exit 1; }
+          echo "Secretos presentes"
+
+      - name: 2. Sistema, Xcode y disco
+        run: |
+          sw_vers
+          xcodebuild -version
+          df -h /
+          sysctl -n hw.memsize
+
+      - name: 3. Liberar espacio
+        continue-on-error: true
+        run: |
+          xcrun simctl delete all || true
+          SEL="$(xcode-select -p | sed 's#/Contents/Developer$##')"
+          SELR="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$SEL")"
+          for x in /Applications/Xcode*.app; do
+            [ -L "$x" ] && continue
+            R="$(python3 -c 'import os,sys;print(os.path.realpath(sys.argv[1]))' "$x")"
+            [ "$R" = "$SELR" ] && continue
+            sudo rm -rf "$x"
+          done
+          df -h /
+
+      - name: 4. Descargar el juego
+        env:
+          ENC: ${{ inputs.game_url_enc }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/game"
+          printf '%s' "$ENC" | openssl base64 -d -A \
+            | openssl enc -d -aes-256-cbc -pbkdf2 -iter 10000 -pass env:ARTIFACT_PASSWORD > "$HOME/urls.txt" \
+            || { echo "::error::No se pudieron descifrar los enlaces (la contrasena de la app no coincide con ARTIFACT_PASSWORD)"; exit 1; }
+          cd "$HOME/game"
+          while IFS= read -r url || [ -n "$url" ]; do
+            [ -z "$url" ] && continue
+            echo "::add-mask::$url"
+            if echo "$url" | grep -q "drive.google.com"; then
+              python3 -m pip install --break-system-packages gdown >/dev/null 2>&1 || python3 -m pip install gdown >/dev/null
+              python3 -m gdown --fuzzy "$url"
+            else
+              curl -L --fail -sS --retry 3 -OJ "$url"
+            fi
+          done < "$HOME/urls.txt"
+          rm -f "$HOME/urls.txt"
+          for f in *; do
+            case "$f" in
+              *.nsp|*.xci|*.nsz|*.xcz) ;;
+              *) echo "Aviso: '$f' no tiene extension de juego; se renombra a .nsp"; mv "$f" "$f.nsp" ;;
+            esac
+          done
+          ls -lh "$HOME/game"
+          df -h /
+
+      - name: 5. Preparar prod.keys
+        run: printf '%s' "$PROD_KEYS_B64" | base64 -d > "$HOME/prod.keys"
+
+      - name: 6. Instalar herramientas de nxnative
+        run: |
+          set -euo pipefail
+          xcodebuild -downloadComponent MetalToolchain
+          git clone --depth 1 -b iphone-4gb https://github.com/WavyKisuke/nxnative.git "$HOME/nxnative"
+          brew install xcodegen zstd glslang
+          dotnet --version >/dev/null 2>&1 || brew install --cask dotnet-sdk
+          PKGS=(lz4 "capstone>=5,<6" fonttools nsz zbic "backports.zstd; python_version < '3.14'")
+          python3 -m pip install --break-system-packages "${PKGS[@]}" || python3 -m pip install "${PKGS[@]}"
+          df -h /
+
+      - name: 7. Construir el IPA
+        env:
+          MEM: ${{ inputs.memory }}
+        run: |
+          set -euo pipefail
+          case "$MEM" in
+            4gb) FLAGS=(--4gb) ;;
+            6gb) FLAGS=(--6gb) ;;
+            256) FLAGS=(--older-iphone 256) ;;
+            *)   FLAGS=() ;;
+          esac
+          mkdir -p "$RUNNER_TEMP/out"
+          cd "$HOME/nxnative"
+          python3 scripts/build_ipa_from_nsp.py "$HOME/game" -k "$HOME/prod.keys" ${FLAGS[@]+"${FLAGS[@]}"} -o "$RUNNER_TEMP/out/game.ipa"
+          IPA="$RUNNER_TEMP/out/game.ipa"
+          [ -f "$IPA" ] || IPA="$(find "$HOME/game" "$RUNNER_TEMP/out" -name '*.ipa' -type f 2>/dev/null | head -1)"
+          [ -n "$IPA" ] && [ -f "$IPA" ] || { echo "::error::El script termino pero no encontre ningun .ipa"; exit 1; }
+          mv "$IPA" "$RUNNER_TEMP/game.ipa"
+          rm -rf "$HOME/game" "$HOME/prod.keys"
+          ls -lh "$RUNNER_TEMP/game.ipa"
+          df -h /
+
+      - name: 8. Cifrar el IPA
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 10000 -salt -pass env:ARTIFACT_PASSWORD \
+            -in "$RUNNER_TEMP/game.ipa" -out "$RUNNER_TEMP/out/game.ipa.enc"
+          rm -f "$RUNNER_TEMP/game.ipa"
+          ls -lh "$RUNNER_TEMP/out"
+
+      - name: 9. Subir resultado cifrado
+        uses: actions/upload-artifact@v4
         with:
-          name: NxForge-Studio-ipa
-          path: NusaLibrary/NxForge-Studio.ipa
+          name: game-ipa-enc
+          path: ${{ runner.temp }}/out/game.ipa.enc
+          compression-level: 0
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Limpiar
+        if: always()
+        run: rm -rf "$HOME/prod.keys" "$HOME/game" "$HOME/urls.txt" || true
