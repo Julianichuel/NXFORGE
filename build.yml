@@ -1,5 +1,6 @@
 name: Build app IPA
 
+# Compila la app NxForge Studio (sin firmar) cada vez que subes el zip, o a mano.
 on:
   workflow_dispatch:
   push:
